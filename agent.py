@@ -17,16 +17,20 @@ def run_agent(question, provider, tools, max_steps=6):
     # tool result kèm đúng tool_call_id vào messages; sau đó gọi model tiếp.
     # Khi có final answer, kiểm tra nguồn như yêu cầu ở Bài 4 trong GUIDE.md.
     # Trả completed, max_steps hoặc error cùng answer, trace và usage.
+    schemas = getattr(tools, 'schemas', SCHEMAS)
+    system_prompt = getattr(tools, 'system_prompt', SYSTEM_PROMPT)
+
     messages = [
-        {'role': 'system', 'content': SYSTEM_PROMPT},
+        {'role': 'system', 'content': system_prompt},
         {'role': 'user', 'content': question}
     ]
     trace = []
     usage = []
+    observed_urls = set()   # URL từ các get_incident_details thành công
 
     for step in range(1, max_steps + 1):
         try:
-            response = provider.complete(messages, SCHEMAS)
+            response = provider.complete(messages, schemas)
         except (RuntimeError, KeyError, ValueError) as exc:
             trace.append({'event': 'error', 'step': step,
                          'error': str(exc)[:200]})
@@ -40,6 +44,13 @@ def run_agent(question, provider, tools, max_steps=6):
         if not response['calls']:
             answer = response['message'].get('content') or ''
             if response['finish'] == 'stop':
+                if observed_urls and not any(url in answer for url in observed_urls):
+                    trace.append({'event': 'validation_missing_source', 'step': step,
+                                  'expected_any_of': sorted(observed_urls)})
+                    messages.append({'role': 'user', 'content':
+                                     'Câu trả lời thiếu nguồn. Hãy viết lại và dẫn ít nhất một URL incident '
+                                     'đã quan sát từ tool: ' + ', '.join(sorted(observed_urls))})
+                    continue
                 return {'status': 'completed', 'answer': answer, 'trace': trace, 'usage': usage}
             trace.append({'event': 'error', 'step': step,
                          'error': f"finish={response['finish']}"})
@@ -56,6 +67,10 @@ def run_agent(question, provider, tools, max_steps=6):
                           'message': f'Arguments không phải JSON hợp lệ: {exc.msg}'}
             else:
                 result = tools.execute(call['name'], args)
+            if (call['name'] == 'get_incident_details' and isinstance(result, dict)
+                    and result.get('ok') and result.get('url')):
+                observed_urls.add(result['url'])
+
             trace.append({'event': 'tool', 'step': step,
                          'name': call['name'], 'arguments': args, 'result': result})
             messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': json.dumps(
