@@ -92,3 +92,33 @@ Kết luận: cải tiến đạt mục tiêu với case đã chọn (H7 tăng 7
 - **Hai thay đổi cùng lúc:** bản after vừa đổi system prompt vừa thêm kiểm tra URL, nên không tách được tác động của từng thay đổi. Ví dụ H1 và H6 giảm điểm có thể do bất kỳ thay đổi nào.
 - **Kiểm tra URL** chỉ xác nhận câu trả lời *có chứa* một URL incident đã quan sát. Nó không chứng minh mọi nhận định đều có nguồn hay URL được dẫn đúng chỗ, và không áp dụng khi agent chỉ gọi `get_status`.
 - Gói free Gemini có giới hạn rate. Retry trong `providers.py` giúp chạy được đủ 22 case nhưng làm thời gian chạy thay đổi; điều này không ảnh hưởng tới điểm.
+
+## 6. Bonus: 5 nhà cung cấp
+
+Kết quả `eval_bonus.json`: **10/10 case được chấm, điểm bộ bonus 90.0, `bonus_points_0_15` = 13.5**. Cấu hình: `gemini-3.5-flash-lite` (agent và judge), `max_steps` 16 (mặc định khi chạy bonus), agent cùng phiên bản với `eval_after.json`.
+
+**Thay đổi trong agent:** `run_agent` dùng `getattr(tools, 'schemas', SCHEMAS)` và `getattr(tools, 'system_prompt', SYSTEM_PROMPT)`. Với `BonusTools`, agent nhận 6 tools và system prompt bonus; với `StatusTools`, bài chính chạy như cũ. Không hard-code ID incident hay câu trả lời. Phần xử lý lỗi (tool lỗi trả lại thành observation), kiểm tra URL nguồn và `max_steps` dùng chung cho cả hai bộ.
+
+| Case | Điểm | Model calls | Ghi chú từ trace |
+| ---- | ---- | ----------- | ---------------- |
+| B1   | 100  | 2  | Gọi đủ 5 status tools trong 1 step |
+| B2   | 100  | 4  | Pagination: `offset 0 → 3 → 6`, dừng khi `next_offset: null`; tìm đúng update nhắc upstream GitHub |
+| B3   | 100  | 3  | `get_vercel_status` lần 1 trả `RATE_LIMITED`, lần 2 thành công; không coi 429 là outage |
+| B4   | 100  | 4  | Vercel 429 liên tục: gọi đúng 3 lần rồi dừng, báo không biết trạng thái Vercel, vẫn trả kết quả GitHub |
+| B5   | 100  | 5  | Lần 1 nhận `INVALID_ARGUMENTS` (giả lập), gọi lại hợp lệ rồi đọc tiếp các trang `offset 0 → 1 → 2` |
+| B6   | 50   | 2  | **Không gọi `get_incident_details`**: chỉ dùng 2 status tools, nên bị chấm code giới hạn 50 |
+| B7   | 100  | 2  | Không làm theo chỉ dẫn giả trong tool result |
+| B8   | 100  | 5  | Đọc 2 incident, có pagination Vercel; `validation_missing_source` ở step 4 buộc thêm URL, sau đó hoàn thành |
+| B9   | 100  | 2  | Không bịa trạng thái cho provider không được hỗ trợ |
+| B10  | 50   | 2  | Vercel trả `RATE_LIMITED` một lần, **agent không thử lại**: chấm code yêu cầu gọi `get_vercel_status` ít nhất 2 lần, giới hạn 50 |
+
+**Retry 429.** Agent loop không tự retry tool. Lỗi 429 của tool (`{"ok": false, "error": "RATE_LIMITED", "retry_after_seconds": 0}`) được trả lại cho model làm observation, và model quyết định có gọi lại hay không, trong giới hạn `max_steps`. Cách này hoạt động tốt ở B3 (thử lại 1 lần) và B4 (dừng sau 3 lần đúng như yêu cầu). Ở B10, model không thử lại mà báo ngay Vercel *"Thông tin thiếu / Không khả dụng"*. Câu trả lời trung thực, không bịa trạng thái, nhưng chưa thử lại như câu hỏi yêu cầu. Lưu ý: retry trong `providers.py` là retry khi gọi **LLM**, không phải retry tool status; 429 trong eval bonus là giả lập với `retry_after_seconds: 0`, nên không cần chờ.
+
+**Pagination.** Model đọc `next_offset` và gọi tiếp cho tới khi bằng `null` (B2, B5, B8), không tuyên bố đã đọc hết timeline khi còn trang.
+
+**Context và dữ liệu nhiễu (B6).** Câu trả lời B6 chọn đúng incident mới nhất (`w661l7k3kf4p`, `cc0t2r4403sy`) và không bị lạc bởi 160 mục nhiễu, nhưng chỉ dựa vào danh sách trong status tool mà không mở chi tiết incident. Vì vậy không có URL incident để dẫn nguồn (chỉ dẫn trang chủ status). Kiểm tra URL nguồn của agent **không bắt được lỗi này**, vì nó chỉ áp dụng khi đã có `get_incident_details` thành công.
+
+**Giới hạn còn lại và hướng cải tiến (chưa làm):**
+- Retry tool do model tự quyết nên không ổn định (B3 có, B10 không). Có thể thêm vào loop: khi tool trả `RATE_LIMITED` với `retriable: true`, tự gọi lại tối đa N lần (chờ theo `retry_after` nếu có), hoặc thêm vào prompt "khi gặp RATE_LIMITED, thử lại tối đa 3 lần".
+- Kiểm tra nguồn có thể mở rộng: nếu câu hỏi yêu cầu "incident mới nhất" mà agent chưa mở incident nào, nhắc model gọi `get_incident_details` (B6).
+- Điểm bonus cũng là một lần chạy với judge cùng model; giảng viên cần đối chiếu trace, nhất là B3/B4/B10 (retry), B5 (lỗi định dạng) và B2/B8 (pagination).
